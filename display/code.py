@@ -3,7 +3,6 @@
 
 from os import getenv
 import time
-import random
 
 import adafruit_connection_manager
 import adafruit_requests
@@ -45,27 +44,53 @@ def url_encode(s):
     s = s.replace(']', '%5D')
     return s
 
-def sync_time_from_internet(requests_session):
+def sync_time_from_internet(requests_session, esp=None):
     """
     Fetches the current time from an internet time service and sets the system time.
     Uses worldtimeapi.org which is free and doesn't require authentication.
     
     Args:
         requests_session: The adafruit_requests session object
+        esp: Optional ESP32 object for DNS resolution
     
     Returns:
         bool: True if time was successfully set, False otherwise
     """
-    # Try multiple time services
+    # Try multiple time services - using simpler/shorter hostnames that might resolve better
     time_services = [
+        "http://worldtimeapi.org/api/ip",  # Auto-detect timezone (simpler endpoint)
         "http://worldtimeapi.org/api/timezone/America/New_York",  # HTTP - no SSL issues
-        "https://worldtimeapi.org/api/timezone/America/New_York",  # HTTPS fallback
-        "http://worldtimeapi.org/api/ip",  # Auto-detect timezone
+        "http://timeapi.io/api/Time/current/zone?timeZone=America/New_York",  # Alternative service
     ]
     
     for service_url in time_services:
         try:
             print(f"Syncing time from: {service_url}")
+            
+            # Try to resolve hostname first if ESP32 object is available
+            # Note: Sometimes DNS resolution fails intermittently - retry a few times
+            if esp is not None:
+                hostname = None
+                if '://' in service_url:
+                    hostname = service_url.split('://')[1].split('/')[0]
+                
+                # Retry DNS resolution up to 3 times
+                dns_resolved = False
+                for dns_retry in range(3):
+                    try:
+                        print(f"Resolving hostname: {hostname} (attempt {dns_retry + 1}/3)")
+                        ip_address = esp.get_host_by_name(hostname)
+                        print(f"Resolved to IP: {ip_address}")
+                        dns_resolved = True
+                        break
+                    except Exception as dns_error:
+                        if dns_retry < 2:  # Not the last attempt
+                            print(f"DNS resolution failed, retrying in 1 second...")
+                            time.sleep(1)
+                        else:
+                            print(f"DNS resolution failed for {hostname} after 3 attempts: {dns_error}")
+                            # Continue anyway - requests_session might handle DNS internally
+            
             try:
                 response = requests_session.get(service_url, timeout=10)
             except Exception as ssl_error:
@@ -363,7 +388,6 @@ def get_onion_headlines(rapidapi_key=None, requests_session=None):
                     "X-RapidAPI-Key": rapidapi_key,
                     "X-RapidAPI-Host": endpoint['host']
                 }
-                
                 # Handle POST requests (like NewsomaticAPI)
                 if endpoint.get('method') == 'POST' and endpoint.get('json_payload'):
                     headers["content-type"] = "application/json"
@@ -478,12 +502,7 @@ def get_onion_headlines(rapidapi_key=None, requests_session=None):
     ]
 
         
-def get_temperature_text(api_key, requests_session):
-    # Get location once at the start
-    lat, lon = get_current_location(requests_session)
-    if lat is None or lon is None:
-        print("Error: Could not determine location. Temperature monitoring stopped.")
-        return
+def get_temperature_text(api_key, lat, lon, requests_session):
     
     print(f"Temperature monitoring started. Location: {lat:.4f}, {lon:.4f}")
                 # Query temperature
@@ -506,7 +525,19 @@ def get_temperature_text(api_key, requests_session):
     
     return text
 
+def get_pretty_time_text():
+        # Get the current time structure
+    now = time.localtime(time.time())
 
+    # Format manually using an f-string
+    # tm_hour, tm_min, and tm_sec are the attributes we need
+    hour = now.tm_hour % 12
+    if hour == 0: hour = 12  # Handle 12 AM/PM logic
+    am_pm = "AM" if now.tm_hour < 12 else "PM"
+
+    pretty_time = f"{hour:02}:{now.tm_min:02}:{now.tm_sec:02} {am_pm}"
+
+    return pretty_time
 def get_redline_departure_text(api_key, requests_session):
     """
     Fetches the next 3 inbound Red Line train arrival times at Porter Square using the MBTA V3 API.
@@ -670,7 +701,7 @@ def get_redline_departure_text(api_key, requests_session):
             
             # Get arrival time (prefer arrival_time, fall back to departure_time)
             arrival_time_str = attributes.get('arrival_time') or attributes.get('departure_time')
-            
+            print(f"arrival_time_str: {arrival_time_str}")
             if not arrival_time_str:
                 continue  # Skip this prediction if no time available
             
@@ -712,17 +743,28 @@ def get_redline_departure_text(api_key, requests_session):
         # Format the output with all train times
         #result = "Next inbound Red Line trains at Porter Square:\n"
         result = ""
+        time_count = 0
         for i, time_desc in enumerate(train_times, 1):
-            result += f"  {time_desc} mins "
+            print(f" {i} time_desc: {time_desc}")
+            if (time_count > 0):
+                result += ","
+            if (time_desc > 5):
+                result += f"{time_desc}"
+                time_count += 1
+            if (time_count == 2):
+                break
+        if (time_count > 0):
+            result += " mins"
+        else:
+            if (len(train_times) > 0):
+                result = f"{time_desc} mins"
+            else:
+                result = "No trains"
         
         return result.strip()  # Remove trailing newline
     
     except Exception as e:
-        error_msg = str(e)
-        if "Expected 01 but got 00" in error_msg or "SSL" in error_msg:
-            return "MBTA API: SSL/TLS connection error (CircuitPython SSL limitation)"
-        else:
-            return f"Error fetching MBTA data: {e}"
+        return "No MBTA data"
 
 def display_monitor(api_key, rapidapi_key, mbta_api_key, requests_session, interval_seconds=10):
     """
@@ -737,7 +779,6 @@ def display_monitor(api_key, rapidapi_key, mbta_api_key, requests_session, inter
         interval_minutes (int): Interval in minutes between temperature queries (default: 10)
     """
     print("started display monitor")
-    random.seed(time.time())
     matrix = Matrix()
     display = matrix.display
 
@@ -759,10 +800,10 @@ def display_monitor(api_key, rapidapi_key, mbta_api_key, requests_session, inter
     ]  # the current working directory (where this file is)
 
     small_font = cwd + "/fonts/Arial-12.bdf"
-    medium_font = cwd + "/fonts/Arial-14.bdf"
+    #medium_font = cwd + "/fonts/Arial-14.bdf"
 
     small_font = bitmap_font.load_font(small_font)
-    medium_font = bitmap_font.load_font(medium_font)
+    #medium_font = bitmap_font.load_font(medium_font)
 
     TEMP_COLOR = 0xFFA800
     MAIN_COLOR = 0x9000FF  # weather condition
@@ -770,8 +811,8 @@ def display_monitor(api_key, rapidapi_key, mbta_api_key, requests_session, inter
     RED_COLOR = 0xFF0000
     glyphs = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-,.: "
     small_font.load_glyphs(glyphs)
-    medium_font.load_glyphs(glyphs)
-    medium_font.load_glyphs(("°",))  # a non-ascii character we need for sure
+    #medium_font.load_glyphs(glyphs)
+    #medium_font.load_glyphs(("°",))  # a non-ascii character we need for sure
 
     info_text_label = Label(small_font)
     info_text_label.x = 1
@@ -783,19 +824,49 @@ def display_monitor(api_key, rapidapi_key, mbta_api_key, requests_session, inter
     group.append(info_text_label)  # add the clock label to the group
     state = 1
     max_state = 2 
+
+    location_found = False
+    temperature_query_interval_secs = 240
+    redline_query_interval_secs = 60
+    last_temperature_query_time = 0
+    last_redline_query_time = 0
+    last_temperature_text = ""
+    last_redline_text = ""
+
     while True:
         try:
             gc.collect()
             print(f"Free memory: {gc.mem_free()}")
+            if (not location_found):
+                lat,lon = get_current_location(requests_session)
+                if lat is None or lon is None:
+                    print("Error: Could not determine location. Temperature monitoring not possible.")
+                    location_found = False
+                else:
+                    location_found = True
+
+            if (last_temperature_text == "" or time.time() - last_temperature_query_time > temperature_query_interval_secs):
+                last_temperature_text = get_temperature_text(api_key, lat, lon, requests_session)
+                last_temperature_query_time = time.time()
+                print(f"updated temperature_text: {last_temperature_text}")
+            if (last_redline_text == "" or time.time() - last_redline_query_time > redline_query_interval_secs):
+                last_redline_text = get_redline_departure_text(mbta_api_key, requests_session)
+                last_redline_query_time = time.time()
+                print(f"updated redline_text: {last_redline_text}")
             if state == 1:
-                color = DESCRIPTION_COLOR
-                text = get_temperature_text(api_key, requests_session)
+                if (location_found):
+                    color = DESCRIPTION_COLOR
+                    text = last_temperature_text
+                else:
+                    color = RED_COLOR
+                    text = "no Temp avail"
             elif state == 2:
                 color = RED_COLOR
-                text = get_redline_departure_text(mbta_api_key, requests_session)
-            else:
-                text = "Unknown state"
+                text = last_redline_text
+
             print(f"State: {state}, Text: {text}")
+            print(f"time.time(): {time.time()}")
+            text += "\n " + get_pretty_time_text()
             info_text_label.text = text
             info_text_label.color = color
             state += 1
@@ -856,10 +927,24 @@ def main():
             print("could not connect to AP, retrying: ", e)
             continue
     print("Connected to", esp.ap_info.ssid, "\tRSSI:", esp.ap_info.rssi)
+    print("My IP address is", esp.ipv4_address)
+    
+    # Wait a moment for network to stabilize and DNS to be ready
+    print("Waiting for network to stabilize...")
+    time.sleep(2)  # Give DNS time to be ready
+    
+    # Test DNS resolution with a simple hostname first
+    try:
+        print("Testing DNS resolution...")
+        test_ip = esp.get_host_by_name("google.com")
+        print(f"DNS test successful: google.com -> {test_ip}")
+    except Exception as dns_test_error:
+        print(f"DNS test failed: {dns_test_error}")
+        print("DNS may not be ready yet, will retry in time sync function")
     
     # Sync system time from internet
     print("\nSyncing system time from internet...")
-    time_synced = sync_time_from_internet(requests_session)
+    time_synced = sync_time_from_internet(requests_session, esp)
     if time_synced:
         print("System time successfully synced!")
     else:
