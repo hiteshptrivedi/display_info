@@ -869,6 +869,7 @@ def display_monitor(api_key, rapidapi_key, mbta_api_key, requests_session, inter
             print(f"State: {state}, Text: {text}")
             print(f"time.time(): {time.time()}")
             text += "\n " + get_pretty_time_text()
+            #text = "1234567890"
             info_text_label.text = text
             info_text_label.color = color
             state += 1
@@ -933,7 +934,7 @@ def main():
     
     # Wait a moment for network to stabilize and DNS to be ready
     print("Waiting for network to stabilize...")
-    time.sleep(2)  # Give DNS time to be ready
+    time.sleep(5)  # Give DNS time to be ready
     
     # Test DNS resolution with a simple hostname first
     try:
