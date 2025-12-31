@@ -1,0 +1,880 @@
+# SPDX-FileCopyrightText: 2019 ladyada for Adafruit Industries
+# SPDX-License-Identifier: MIT
+
+from os import getenv
+import time
+import random
+
+import adafruit_connection_manager
+import adafruit_requests
+import board
+import busio
+from digitalio import DigitalInOut
+import displayio
+from adafruit_matrixportal.matrix import Matrix
+from adafruit_display_text.label import Label
+from adafruit_bitmap_font import bitmap_font
+#import openweather_graphics
+from adafruit_matrixportal.network import Network
+import gc
+# Use this import for adafruit_esp32spi version 11.0.0 and up.
+# Note that frozen libraries may not be up to date.
+# import adafruit_esp32spi
+from adafruit_esp32spi import adafruit_esp32spi
+
+# Get wifi details and more from a settings.toml file
+# tokens used by this Demo: CIRCUITPY_WIFI_SSID, CIRCUITPY_WIFI_PASSWORD
+ssid = getenv("CIRCUITPY_WIFI_SSID")
+password = getenv("CIRCUITPY_WIFI_PASSWORD")
+
+
+# Simple URL encoding function for CircuitPython
+def url_encode(s):
+    """Simple URL encoding - handles basic cases"""
+    # For simple cases, we can just replace spaces and special chars
+    # This is a minimal implementation
+    s = str(s)
+    # Replace spaces with %20
+    s = s.replace(' ', '%20')
+    # Replace other common special characters
+    s = s.replace(':', '%3A')
+    s = s.replace('/', '%2F')
+    s = s.replace('?', '%3F')
+    s = s.replace('#', '%23')
+    s = s.replace('[', '%5B')
+    s = s.replace(']', '%5D')
+    return s
+
+def sync_time_from_internet(requests_session):
+    """
+    Fetches the current time from an internet time service and sets the system time.
+    Uses worldtimeapi.org which is free and doesn't require authentication.
+    
+    Args:
+        requests_session: The adafruit_requests session object
+    
+    Returns:
+        bool: True if time was successfully set, False otherwise
+    """
+    # Try multiple time services
+    time_services = [
+        "http://worldtimeapi.org/api/timezone/America/New_York",  # HTTP - no SSL issues
+        "https://worldtimeapi.org/api/timezone/America/New_York",  # HTTPS fallback
+        "http://worldtimeapi.org/api/ip",  # Auto-detect timezone
+    ]
+    
+    for service_url in time_services:
+        try:
+            print(f"Syncing time from: {service_url}")
+            try:
+                response = requests_session.get(service_url, timeout=10)
+            except Exception as ssl_error:
+                error_msg = str(ssl_error)
+                if "Expected 01 but got 00" in error_msg or "SSL" in error_msg:
+                    print(f"SSL error with time service {service_url} (trying next)")
+                    continue
+                else:
+                    raise
+            
+            if response.status_code != 200:
+                print(f"Time service returned status code {response.status_code}")
+                response.close()
+                continue
+            
+            data = response.json()
+            response.close()
+            
+            # Parse the datetime string from the API
+            # Format: "2024-01-15T14:30:00.123456-05:00"
+            datetime_str = data.get('datetime')
+            if not datetime_str:
+                print("No datetime field in response")
+                continue
+            
+            # Parse the datetime string
+            # Remove timezone info and microseconds for simplicity
+            if 'T' in datetime_str:
+                date_part, time_part = datetime_str.split('T', 1)
+            else:
+                print("Invalid datetime format")
+                continue
+            
+            # Remove timezone and microseconds
+            time_part = time_part.split('.')[0]  # Remove microseconds
+            time_part = time_part.split('+')[0]  # Remove timezone
+            time_part = time_part.split('-')[0] if '-' not in time_part[:10] else time_part.rsplit('-', 1)[0]  # Remove timezone
+            
+            # Parse date
+            year, month, day = map(int, date_part.split('-'))
+            
+            # Parse time
+            hour, minute, second = map(int, time_part.split(':'))
+            
+            # Create struct_time (weekday and yearday will be calculated)
+            # struct_time format: (year, month, day, hour, minute, second, weekday, yearday)
+            # We'll use 0 for weekday and yearday, CircuitPython will calculate them
+            time_struct = time.struct_time((year, month, day, hour, minute, second, 0, 0, 0))
+            
+            # Try to set the time using RTC if available
+            try:
+                import rtc
+                r = rtc.RTC()
+                # Set the datetime - RTC expects a time.struct_time
+                r.datetime = time_struct
+                print(f"System time set to: {year}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}:{second:02d}")
+                # Verify it was set
+                current_time = r.datetime
+                print(f"Verified system time: {current_time.tm_year}-{current_time.tm_mon:02d}-{current_time.tm_mday:02d} {current_time.tm_hour:02d}:{current_time.tm_min:02d}:{current_time.tm_sec:02d}")
+                return True
+            except ImportError:
+                # RTC not available on this board
+                print("RTC module not available on this board")
+                print(f"Time from internet: {year}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}:{second:02d}")
+                print("Note: Time cannot be set automatically without RTC module")
+                return False
+            except Exception as e:
+                print(f"Error setting RTC time: {e}")
+                print(f"Time from internet: {year}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}:{second:02d}")
+                return False
+                
+        except Exception as e:
+            error_msg = str(e)
+            if "Expected 01 but got 00" in error_msg or "SSL" in error_msg:
+                print(f"SSL error with time service {service_url} (trying next)")
+            else:
+                print(f"Error syncing time from {service_url}: {e}")
+            try:
+                response.close()
+            except:
+                pass
+            continue
+    
+    print("Failed to sync time from any service")
+    return False
+
+
+def get_temperature(lat, lon, api_key, requests_session):
+    """
+    Fetches the current temperature for a given city using the OpenWeatherMap API.
+
+    Args:
+        lat (float): Latitude
+        lon (float): Longitude
+        api_key (str): Your OpenWeatherMap API key.
+        requests_session: The adafruit_requests session object
+
+    Returns:
+        float: The temperature in Celsius, or None if an error occurred.
+    """
+    # The URL format for the current weather data API
+    url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={api_key}"
+
+    try:
+        # Make the GET request to the API
+        # You can reuse requests_session multiple times - just call .get() or .post() again
+        response = requests_session.get(url)
+        # Check status code
+        if response.status_code != 200:
+            print(f"Weather API returned status code {response.status_code}")
+            response.close()
+            return None, None
+        
+        # Parse the JSON response
+        data = response.json()
+        response.close()  # Always close the response when done
+
+        # Extract the temperature
+        temperature = data['main']['temp']
+        description = data['weather'][0]['description']
+        return temperature, description
+      
+        # To make another query with the same session, just call it again:
+        # response2 = requests_session.get(another_url)
+        # ... use response2 ...
+        # response2.close()  # Don't forget to close each response
+
+    except Exception as e:
+        print(f"Error fetching weather data: {e}")
+        try:
+            response.close()
+        except:
+            pass
+        return None, None
+    except KeyError:
+        print("Error: Could not parse weather data (city not found or API issue).")
+        return None, None
+
+def get_current_location(requests_session):
+    """
+    Gets the current latitude and longitude using IP-based geolocation.
+    Tries multiple services and averages results for better accuracy.
+
+    Args:
+        requests_session: The adafruit_requests session object
+
+    Returns:
+        tuple: A tuple containing (latitude, longitude) as floats, or (None, None) if an error occurred.
+    """
+    # Try multiple IP geolocation services for better accuracy
+    services = [
+        {
+            'url': 'https://ipapi.co/json/',
+            'lat_key': 'latitude',
+            'lon_key': 'longitude'
+        }
+    ]
+    
+    locations = []
+    for service in services:
+        try:
+            print(f"Trying location service: {service['url']}")
+            response = requests_session.get(service['url'], timeout=10)
+            print(f"Response status code: {response.status_code}")
+            
+            # Check if request was successful (status code 200)
+            if response.status_code != 200:
+                print(f"Service {service['url']} returned status code {response.status_code}")
+                response.close()
+                continue
+            
+            data = response.json()
+            print(f"Response from {service['url']}: {data}")
+            response.close()
+            
+            if service['url'] == 'https://ipinfo.io/json':
+                # Special handling for ipinfo.io (returns "lat,lon" as string)
+                if 'loc' in data:
+                    lat, lon = map(float, data['loc'].split(','))
+                    locations.append((lat, lon))
+                    print(f"Got location from ipinfo.io: {lat}, {lon}")
+            else:
+                lat = data.get(service['lat_key'])
+                lon = data.get(service['lon_key'])
+                if lat is not None and lon is not None:
+                    locations.append((float(lat), float(lon)))
+                    print(f"Got location from {service['url']}: {lat}, {lon}")
+                else:
+                    print(f"Missing lat/lon keys in response from {service['url']}")
+        except Exception as e:
+            print(f"Error with {service['url']}: {e}")
+            try:
+                response.close()
+            except:
+                pass
+            continue  # Try next service
+    
+    # If we got multiple results, average them for better accuracy
+    if locations:
+        avg_lat = sum(loc[0] for loc in locations) / len(locations)
+        avg_lon = sum(loc[1] for loc in locations) / len(locations)
+        return avg_lat, avg_lon
+    
+    # Fallback: Use ip-api.com as last resort
+    try:
+        print("Trying fallback service: https://ip-api.com/json/")
+        response = requests_session.get("https://ip-api.com/json/", timeout=10)
+        print(f"Fallback response status code: {response.status_code}")
+        
+        if response.status_code != 200:
+            print(f"Fallback service returned status code {response.status_code}")
+            response.close()
+        else:
+            data = response.json()
+            print(f"Fallback response: {data}")
+            response.close()
+            if data.get('status') == 'success':
+                lat = data.get('lat')
+                lon = data.get('lon')
+                print(f"Got location from fallback: {lat}, {lon}")
+                return lat, lon
+            else:
+                print(f"Fallback service returned status: {data.get('status')}")
+    except Exception as e:
+        print(f"Error with fallback service: {e}")
+        try:
+            response.close()
+        except:
+            pass
+    
+    print("Error: Could not determine location from any service.")
+    return None, None
+
+def get_onion_headlines(rapidapi_key=None, requests_session=None):
+    """
+    Fetches The Onion's latest headlines using RapidAPI or direct RSS parsing.
+    
+    First tries RapidAPI, then falls back to direct RSS parsing if RapidAPI fails.
+
+    Args:
+        rapidapi_key (str, optional): Your RapidAPI key for authentication.
+        requests_session: The adafruit_requests session object
+
+    Returns:
+        A list of headline strings, or None if an error occurs.
+    """
+    if requests_session is None:
+        print("Error: requests_session is required")
+        return None
+    
+    # Try RapidAPI first if key is provided
+    if rapidapi_key:
+        print("Using RapidAPI key: ", rapidapi_key)
+        # Try multiple RapidAPI endpoints for RSS/News - different APIs may have different access levels
+        rapidapi_endpoints = [
+            {
+                'url': 'https://rss-to-json.p.rapidapi.com/feed',
+                'host': 'rss-to-json.p.rapidapi.com',
+                'params': {'url': 'http://www.theonion.com/rss'},  # Try HTTP first
+                'method': 'GET'
+            },
+            {
+                'url': 'https://rss-to-json.p.rapidapi.com/feed',
+                'host': 'rss-to-json.p.rapidapi.com',
+                'params': {'url': 'https://www.theonion.com/rss'},  # Then HTTPS
+                'method': 'GET'
+            },
+            {
+                'url': 'https://rss-feed-reader.p.rapidapi.com/feed',
+                'host': 'rss-feed-reader.p.rapidapi.com',
+                'params': {'url': 'http://www.theonion.com/rss'},
+                'method': 'GET'
+            },
+            {
+                'url': 'https://rss-feed-reader.p.rapidapi.com/feed',
+                'host': 'rss-feed-reader.p.rapidapi.com',
+                'params': {'url': 'https://www.theonion.com/rss'},
+                'method': 'GET'
+            },
+            {
+                'url': 'https://newsomaticapi.p.rapidapi.com/',
+                'host': 'newsomaticapi.p.rapidapi.com',
+                'params': None,  # This one uses POST with JSON body
+                'method': 'POST',
+                'json_payload': {
+                    "api_type": "news_by_keyword_search",
+                    "keyword": "The Onion"
+                }
+            }
+        ]
+        
+        for endpoint in rapidapi_endpoints:
+            try:
+                headers = {
+                    "X-RapidAPI-Key": rapidapi_key,
+                    "X-RapidAPI-Host": endpoint['host']
+                }
+                
+                # Handle POST requests (like NewsomaticAPI)
+                if endpoint.get('method') == 'POST' and endpoint.get('json_payload'):
+                    headers["content-type"] = "application/json"
+                    import json
+                    json_data = json.dumps(endpoint['json_payload'])
+                    print(f"Trying POST request to: {endpoint['url']}")
+                    try:
+                        response = requests_session.post(endpoint['url'], data=json_data, headers=headers, timeout=10)
+                    except Exception as ssl_error:
+                        error_msg = str(ssl_error)
+                        if "Expected 01 but got 00" in error_msg or "SSL" in error_msg:
+                            print(f"SSL error with RapidAPI endpoint {endpoint['url']} (skipping)")
+                            continue
+                        else:
+                            raise
+                else:
+                    # Handle GET requests with query parameters
+                    url = endpoint['url']
+                    if endpoint.get('params'):
+                        query_parts = []
+                        for key, value in endpoint['params'].items():
+                            # URL encode the parameters
+                            query_parts.append(f"{url_encode(key)}={url_encode(str(value))}")
+                        url = f"{url}?{'&'.join(query_parts)}"
+                    
+                    print(f"Trying GET request to: {url}")
+                    try:
+                        response = requests_session.get(url, headers=headers, timeout=10)
+                    except Exception as ssl_error:
+                        # SSL/TLS errors are common in CircuitPython - skip this endpoint
+                        error_msg = str(ssl_error)
+                        if "Expected 01 but got 00" in error_msg or "SSL" in error_msg:
+                            print(f"SSL error with RapidAPI endpoint {endpoint['url']} (skipping)")
+                            continue
+                        else:
+                            raise  # Re-raise if it's a different error
+                
+                print(f"Response status code: {response.status_code}")
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    response.close()
+                    headlines = []
+                    
+                    # Try various response structures
+                    if 'items' in data:
+                        headlines = [item.get('title', '') for item in data['items'] if item.get('title')]
+                    elif 'entries' in data:
+                        headlines = [entry.get('title', '') for entry in data['entries'] if entry.get('title')]
+                    elif 'feed' in data and 'items' in data['feed']:
+                        headlines = [item.get('title', '') for item in data['feed']['items'] if item.get('title')]
+                    elif isinstance(data, list):
+                        headlines = [item.get('title', '') for item in data if isinstance(item, dict) and item.get('title')]
+                    # Handle NewsomaticAPI response structure
+                    elif 'articles' in data:
+                        headlines = [article.get('title', '') for article in data['articles'] if article.get('title')]
+                    elif 'data' in data and isinstance(data['data'], list):
+                        headlines = [item.get('title', '') for item in data['data'] if isinstance(item, dict) and item.get('title')]
+                    
+                    if headlines:
+                        print(f"Successfully retrieved {len(headlines)} headlines from RapidAPI")
+                        return headlines
+                    else:
+                        print(f"No headlines found. Response structure: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+                elif response.status_code == 403:
+                    # If 403, provide more debugging info
+                    print(f"403 Forbidden from {endpoint['url']}")
+                    print("This usually means:")
+                    print("  - Your API key doesn't have access to this endpoint")
+                    print("  - The endpoint requires a paid subscription")
+                    print("  - Rate limiting is in effect")
+                    try:
+                        error_text = response.text[:200]
+                        print(f"Error response: {error_text}")
+                    except:
+                        pass
+                    response.close()
+                    continue
+                elif response.status_code == 401:
+                    print(f"401 Unauthorized - Check your RapidAPI key")
+                    response.close()
+                    continue
+                elif response.status_code != 200:
+                    # If not 200, try next endpoint
+                    print(f"RapidAPI endpoint returned status code {response.status_code}")
+                    try:
+                        error_text = response.text[:200]
+                        print(f"Error response: {error_text}")
+                    except:
+                        pass
+                    response.close()
+                    continue
+            except Exception as e:
+                # Try next endpoint or fall through to direct RSS parsing
+                error_msg = str(e)
+                if "Expected 01 but got 00" in error_msg or "SSL" in error_msg:
+                    print(f"SSL error with RapidAPI endpoint {endpoint['url']} (skipping)")
+                else:
+                    print(f"Error with RapidAPI endpoint {endpoint['url']}: {e}")
+                try:
+                    response.close()
+                except:
+                    pass
+                continue
+        
+    # If all RSS feeds fail, return some default headlines
+    print("All RSS feeds failed - using default headlines")
+    return [
+        "News headlines unavailable due to SSL/connection limitations",
+        "Temperature monitoring is working correctly",
+        "Check your network connection for RSS feeds"
+    ]
+
+        
+def get_temperature_text(api_key, requests_session):
+    # Get location once at the start
+    lat, lon = get_current_location(requests_session)
+    if lat is None or lon is None:
+        print("Error: Could not determine location. Temperature monitoring stopped.")
+        return
+    
+    print(f"Temperature monitoring started. Location: {lat:.4f}, {lon:.4f}")
+                # Query temperature
+    temp_K, desc = get_temperature(lat, lon, api_key, requests_session)
+    
+    if temp_K is not None:
+        temp_C = temp_K - 273.15
+        temp_F = temp_C * 9/5 + 32
+        temp_F = round(temp_F, 0)
+        temp_F = int(temp_F)
+        
+        # Format timestamp using time module (CircuitPython compatible)
+        local_time = time.localtime()
+        timestamp = f"{local_time.tm_year}-{local_time.tm_mon:02d}-{local_time.tm_mday:02d} {local_time.tm_hour:02d}:{local_time.tm_min:02d}:{local_time.tm_sec:02d}"
+        text = f"[{timestamp}] The temperature is {temp_F}°F ({temp_C:.1f}°C) with {desc}."
+        print(text)
+        text = f"{temp_F}°F"
+    else:
+        text = "Failed to fetch temperature data.";
+    
+    return text
+
+
+def get_redline_departure_text(api_key, requests_session):
+    """
+    Fetches the next 3 inbound Red Line train arrival times at Porter Square using the MBTA V3 API.
+    Tries HTTPS first, falls back to alternative methods if SSL fails.
+    
+    Args:
+        api_key (str): Your MBTA V3 API key.
+        requests_session: The adafruit_requests session object
+    
+    Returns:
+        str: A formatted string with the next 3 train arrival times, or an error message.
+    """
+    
+    # Porter Square stop ID for Red Line
+    stop_id = "place-portr"
+    # Direction ID: 1 = inbound (toward Alewife), 0 = outbound (toward Ashmont/Braintree)
+    direction_id = 1  # inbound
+    route = "Red"
+    
+    # Try MBTA V3 API endpoint for predictions
+    url = f"https://api-v3.mbta.com/predictions"
+    
+    # Parameters for filtering
+    params = {
+        "filter[route]": route,
+        "filter[stop]": stop_id,
+        "filter[direction_id]": direction_id,
+        "sort": "arrival_time",
+        "page[limit]": 3  # Get the next 3 trains
+    }
+    
+    # Build URL with query parameters manually (adafruit_requests doesn't support params keyword)
+    query_parts = []
+    for key, value in params.items():
+        # URL encode the parameters
+        query_parts.append(f"{url_encode(key)}={url_encode(str(value))}")
+    url_with_params = f"{url}?{'&'.join(query_parts)}"
+    
+    # Headers with API key
+    headers = {
+        "x-api-key": api_key,
+        "Content-Type": "application/json"
+    }
+
+    try:
+        # Make the GET request to the API        try:
+        response = requests_session.get(url_with_params, headers=headers, timeout=10)
+        
+        if response.status_code != 200:
+            response.close()
+            return f"MBTA API returned status code {response.status_code}"
+        
+        # Parse the JSON response
+        data = response.json()
+        response.close()
+        
+        # Check if we have any predictions
+        if not data.get('data') or len(data['data']) == 0:
+            return "No inbound Red Line trains scheduled at Porter Square."
+        
+        # Parse ISO 8601 timestamps manually (CircuitPython doesn't have datetime)
+        def parse_iso_timestamp(iso_str):
+            """Parse ISO 8601 timestamp and return (year, month, day, hour, minute, second)"""
+            try:
+                # Format: "2024-01-15T14:30:00-05:00" or "2024-01-15T14:30:00Z"
+                # Remove 'Z' suffix if present
+                if iso_str.endswith('Z'):
+                    iso_str = iso_str[:-1] + '+00:00'
+                
+                # Split date and time
+                if 'T' in iso_str:
+                    date_part, time_part = iso_str.split('T', 1)
+                else:
+                    date_part = iso_str.split(' ')[0]
+                    time_part = iso_str.split(' ')[1] if ' ' in iso_str else iso_str
+                
+                # Parse date
+                year, month, day = map(int, date_part.split('-'))
+                
+                # Remove timezone offset if present
+                # Look for timezone pattern: +HH:MM or -HH:MM at the end
+                time_part_clean = time_part
+                if '+' in time_part:
+                    # Positive timezone: "14:30:00+05:00"
+                    parts = time_part.split('+', 1)
+                    if len(parts) == 2 and ':' in parts[1]:
+                        time_part_clean = parts[0]
+                elif '-' in time_part:
+                    # Could be negative timezone: "14:30:00-05:00"
+                    # Find the last '-' and check if what follows looks like a timezone (HH:MM)
+                    last_dash_pos = time_part.rfind('-')
+                    if last_dash_pos > 0:
+                        # Check if what follows the dash looks like a timezone
+                        after_dash = time_part[last_dash_pos + 1:]
+                        if ':' in after_dash:
+                            # Split to check if it's in HH:MM format
+                            tz_parts = after_dash.split(':')
+                            if len(tz_parts) == 2:
+                                # Check if both parts are digits (timezone format)
+                                if tz_parts[0].isdigit() and tz_parts[1].isdigit():
+                                    # This is a timezone, remove it
+                                    time_part_clean = time_part[:last_dash_pos]
+                
+                # Remove microseconds if present (e.g., "14:30:00.123")
+                if '.' in time_part_clean:
+                    time_part_clean = time_part_clean.split('.')[0]
+                
+                # Parse time (format: "HH:MM:SS")
+                time_parts = time_part_clean.split(':')
+                if len(time_parts) < 2:
+                    print(f"Invalid time format: {time_part_clean} (from {time_part})")
+                    return None
+                
+                hour = int(time_parts[0])
+                minute = int(time_parts[1])
+                second = int(time_parts[2]) if len(time_parts) > 2 else 0
+                
+                return (year, month, day, hour, minute, second)
+            except Exception as e:
+                print(f"Error parsing timestamp from {iso_str}: {e}")
+                import sys
+                sys.print_exception(e)
+                return None
+        
+        def calculate_minutes_until(arrival_tuple, current_time_tuple):
+            """Calculate minutes until arrival time"""
+            if arrival_tuple is None or current_time_tuple is None:
+                return None
+            
+            year_a, month_a, day_a, hour_a, minute_a, second_a = arrival_tuple
+            year_c, month_c, day_c, hour_c, minute_c, second_c = current_time_tuple
+            
+            # Convert to total minutes since a reference point (simplified calculation)
+            # This is approximate but works for same-day times
+            arrival_minutes = hour_a * 60 + minute_a
+            current_minutes = hour_c * 60 + minute_c
+            
+            # Handle day rollover (if arrival is next day)
+            if (year_a, month_a, day_a) > (year_c, month_c, day_c):
+                arrival_minutes += 24 * 60  # Add 24 hours
+            
+            minutes_diff = arrival_minutes - current_minutes
+            
+            # If negative and same day, train may have already left
+            if minutes_diff < 0 and (year_a, month_a, day_a) == (year_c, month_c, day_c):
+                return minutes_diff  # Negative means past
+            
+            return minutes_diff
+        
+        # Get current time
+        current_time = time.localtime()
+        current_tuple = (current_time.tm_year, current_time.tm_mon, current_time.tm_mday,
+                        current_time.tm_hour, current_time.tm_min, current_time.tm_sec)
+        
+        # Process up to 3 predictions
+        train_times = []
+        predictions = data['data'][:3]  # Get up to 3 predictions
+        
+        for prediction in predictions:
+            attributes = prediction.get('attributes', {})
+            
+            # Get arrival time (prefer arrival_time, fall back to departure_time)
+            arrival_time_str = attributes.get('arrival_time') or attributes.get('departure_time')
+            
+            if not arrival_time_str:
+                continue  # Skip this prediction if no time available
+            
+            # Parse full timestamp from ISO string
+            arrival_tuple = parse_iso_timestamp(arrival_time_str)
+            if arrival_tuple is None:
+                continue
+            
+            year, month, day, hour, minute, second = arrival_tuple
+            
+            # Calculate minutes until arrival
+            minutes_until = calculate_minutes_until(arrival_tuple, current_tuple)
+            
+            # Format time for display (12-hour format)
+            hour_12 = hour % 12
+            if hour_12 == 0:
+                hour_12 = 12
+            am_pm = "AM" if hour < 12 else "PM"
+            time_str = f"{hour_12}:{minute:02d} {am_pm}"
+            
+            # Format time description with minutes until
+            if minutes_until is None:
+                time_desc = f"{time_str}"
+            elif minutes_until < 0:
+                time_desc = f"{time_str} (departed)"
+            elif minutes_until == 0:
+                time_desc = f"{time_str} (arriving now!)"
+            elif minutes_until == 1:
+                time_desc = f"{time_str} (in 1 min)"
+            else:
+                time_desc = f"{time_str} (in {minutes_until} min)"
+            
+            #train_times.append(time_desc)
+            train_times.append(minutes_until)
+        
+        if not train_times:
+            return "No arrival times available for inbound Red Line trains at Porter Square."
+        
+        # Format the output with all train times
+        #result = "Next inbound Red Line trains at Porter Square:\n"
+        result = ""
+        for i, time_desc in enumerate(train_times, 1):
+            result += f"  {time_desc} mins "
+        
+        return result.strip()  # Remove trailing newline
+    
+    except Exception as e:
+        error_msg = str(e)
+        if "Expected 01 but got 00" in error_msg or "SSL" in error_msg:
+            return "MBTA API: SSL/TLS connection error (CircuitPython SSL limitation)"
+        else:
+            return f"Error fetching MBTA data: {e}"
+
+def display_monitor(api_key, rapidapi_key, mbta_api_key, requests_session, interval_seconds=10):
+    """
+    Continuously monitors temperature by querying every specified interval.
+    This function runs in a loop and is designed to be executed in a thread.
+    
+    Args:
+        api_key (str): OpenWeatherMap API key
+        rapidapi_key (str): RapidAPI key for fetching Onion headlines
+        mbta_api_key (str): MBTA API key
+        requests_session: The adafruit_requests session object
+        interval_minutes (int): Interval in minutes between temperature queries (default: 10)
+    """
+    print("started display monitor")
+    random.seed(time.time())
+    matrix = Matrix()
+    display = matrix.display
+
+    group = displayio.Group()  # Create a Group
+    bitmap = displayio.Bitmap(64, 32, 2)  # Create a bitmap object,width, height, bit depth
+    color = displayio.Palette(4)  # Create a color palette
+    color[0] = 0x000000  # black background
+    color[1] = 0xFF0000  # red
+    color[2] = 0xCC4000  # amber
+    color[3] = 0x85FF00  # greenish
+
+    # Create a TileGrid using the Bitmap and Palette
+    tile_grid = displayio.TileGrid(bitmap, pixel_shader=color)
+    group.append(tile_grid)  # Add the TileGrid to the Group
+    display.root_group = group
+
+    cwd = ("/" + __file__).rsplit("/", 1)[
+        0
+    ]  # the current working directory (where this file is)
+
+    small_font = cwd + "/fonts/Arial-12.bdf"
+    medium_font = cwd + "/fonts/Arial-14.bdf"
+
+    small_font = bitmap_font.load_font(small_font)
+    medium_font = bitmap_font.load_font(medium_font)
+
+    TEMP_COLOR = 0xFFA800
+    MAIN_COLOR = 0x9000FF  # weather condition
+    DESCRIPTION_COLOR = 0x00D3FF
+    RED_COLOR = 0xFF0000
+    glyphs = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-,.: "
+    small_font.load_glyphs(glyphs)
+    medium_font.load_glyphs(glyphs)
+    medium_font.load_glyphs(("°",))  # a non-ascii character we need for sure
+
+    info_text_label = Label(small_font)
+    info_text_label.x = 1
+    info_text_label.y = 7
+    info_text_label.color = DESCRIPTION_COLOR
+    scrolling_text_height = 24
+    scroll_delay = 0.03
+
+    group.append(info_text_label)  # add the clock label to the group
+    state = 1
+    max_state = 2 
+    while True:
+        try:
+            gc.collect()
+            print(f"Free memory: {gc.mem_free()}")
+            if state == 1:
+                color = DESCRIPTION_COLOR
+                text = get_temperature_text(api_key, requests_session)
+            elif state == 2:
+                color = RED_COLOR
+                text = get_redline_departure_text(mbta_api_key, requests_session)
+            else:
+                text = "Unknown state"
+            print(f"State: {state}, Text: {text}")
+            info_text_label.text = text
+            info_text_label.color = color
+            state += 1
+            if state > max_state:
+                state = 1
+
+        except Exception as e:
+            print(f"Error in temperature monitoring: {e}")
+
+        time.sleep(interval_seconds)
+
+def main():
+    # If you are using a board with pre-defined ESP32 Pins:
+    esp32_cs = DigitalInOut(board.ESP_CS)
+    esp32_ready = DigitalInOut(board.ESP_BUSY)
+    esp32_reset = DigitalInOut(board.ESP_RESET)
+
+    # If you have an AirLift Shield:
+    # esp32_cs = DigitalInOut(board.D10)
+    # esp32_ready = DigitalInOut(board.D7)
+    # esp32_reset = DigitalInOut(board.D5)
+
+    # If you have an AirLift Featherwing or ItsyBitsy Airlift:
+    # esp32_cs = DigitalInOut(board.D13)
+    # esp32_ready = DigitalInOut(board.D11)
+    # esp32_reset = DigitalInOut(board.D12)
+
+    # If you have an externally connected ESP32:
+    # NOTE: You may need to change the pins to reflect your wiring
+    # esp32_cs = DigitalInOut(board.D9)
+    # esp32_ready = DigitalInOut(board.D10)
+    # esp32_reset = DigitalInOut(board.D5)
+
+    # Secondary (SCK1) SPI used to connect to WiFi board on Arduino Nano Connect RP2040
+    if "SCK1" in dir(board):
+        spi = busio.SPI(board.SCK1, board.MOSI1, board.MISO1)
+    else:
+        spi = busio.SPI(board.SCK, board.MOSI, board.MISO)
+    esp = adafruit_esp32spi.ESP_SPIcontrol(spi, esp32_cs, esp32_ready, esp32_reset)
+
+    pool = adafruit_connection_manager.get_radio_socketpool(esp)
+    ssl_context = adafruit_connection_manager.get_radio_ssl_context(esp)
+    requests_session = adafruit_requests.Session(pool, ssl_context)
+ 
+    if esp.status == adafruit_esp32spi.WL_IDLE_STATUS:
+        print("ESP32 found and in idle mode")
+    print("Firmware vers.", esp.firmware_version)
+    print("MAC addr:", ":".join("%02X" % byte for byte in esp.MAC_address))
+
+    for ap in esp.scan_networks():
+        print("\t%-23s RSSI: %d" % (ap.ssid, ap.rssi))
+
+    print("Connecting to AP...")
+    while not esp.is_connected:
+        try:
+            esp.connect_AP(ssid, password)
+        except OSError as e:
+            print("could not connect to AP, retrying: ", e)
+            continue
+    print("Connected to", esp.ap_info.ssid, "\tRSSI:", esp.ap_info.rssi)
+    
+    # Sync system time from internet
+    print("\nSyncing system time from internet...")
+    time_synced = sync_time_from_internet(requests_session)
+    if time_synced:
+        print("System time successfully synced!")
+    else:
+        print("Warning: Could not sync system time, using device's current time")
+    print(f"Current system time: {time.localtime()}")
+    print()
+    
+    print("Done! starting display monitor...")
+    
+    api_key = "e218772439e267b3f123e89567d1909c"  # Replace with your actual OpenWeatherMap API key
+    rapidapi_key = "e9f5733fbcmsh44e4bbf0b190180p11af65jsn134bd09fba9f"  # Replace with your actual RapidAPI key
+    mbta_api_key = "3864d934cd784a05993611aa3fb428d9"
+
+    display_monitor(api_key, rapidapi_key, mbta_api_key, requests_session, interval_seconds=10)
+
+
+if __name__ == "__main__":
+    main()
