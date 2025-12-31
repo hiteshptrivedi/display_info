@@ -535,7 +535,7 @@ def get_pretty_time_text():
     if hour == 0: hour = 12  # Handle 12 AM/PM logic
     am_pm = "AM" if now.tm_hour < 12 else "PM"
 
-    pretty_time = f"{hour:02}:{now.tm_min:02}:{now.tm_sec:02} {am_pm}"
+    pretty_time = f"{hour:2}:{now.tm_min:02}:{now.tm_sec:02} {am_pm}"
 
     return pretty_time
 def get_redline_departure_text(api_key, requests_session):
@@ -799,7 +799,9 @@ def display_monitor(api_key, rapidapi_key, mbta_api_key, requests_session, inter
         0
     ]  # the current working directory (where this file is)
 
-    small_font = cwd + "/fonts/Arial-12.bdf"
+
+    #small_font = cwd + "/fonts/Arial-12.bdf"
+    small_font = cwd + "/fonts/MyFont-08.bdf"
     #medium_font = cwd + "/fonts/Arial-14.bdf"
 
     small_font = bitmap_font.load_font(small_font)
