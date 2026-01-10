@@ -25,6 +25,9 @@ from adafruit_esp32spi import adafruit_esp32spi
 # tokens used by this Demo: CIRCUITPY_WIFI_SSID, CIRCUITPY_WIFI_PASSWORD
 ssid = getenv("CIRCUITPY_WIFI_SSID")
 password = getenv("CIRCUITPY_WIFI_PASSWORD")
+api_key = getenv("OPENWEATHER_API_KEY")  # Replace with your actual OpenWeatherMap API key
+onionapi_key = getenv("ONION_API_KEY")  # Replace with your actual RapidAPI key
+mbta_api_key = getenv("MBTA_API_KEY")
 
 
 # Simple URL encoding function for CircuitPython
@@ -212,7 +215,7 @@ def get_temperature(lat, lon, api_key, requests_session):
         temperature = data['main']['temp']
         description = data['weather'][0]['description']
         return temperature, description
-      
+
         # To make another query with the same session, just call it again:
         # response2 = requests_session.get(another_url)
         # ... use response2 ...
@@ -322,16 +325,16 @@ def get_current_location(requests_session):
             pass
     
     print("Error: Could not determine location from any service.")
-    return None, None
+    return (None, None)
 
-def get_onion_headlines(rapidapi_key=None, requests_session=None):
+def get_onion_headlines(onionapi_key=None, requests_session=None):
     """
     Fetches The Onion's latest headlines using RapidAPI or direct RSS parsing.
     
     First tries RapidAPI, then falls back to direct RSS parsing if RapidAPI fails.
 
     Args:
-        rapidapi_key (str, optional): Your RapidAPI key for authentication.
+        onionapi_key (str, optional): Your RapidAPI key for authentication.
         requests_session: The adafruit_requests session object
 
     Returns:
@@ -342,8 +345,8 @@ def get_onion_headlines(rapidapi_key=None, requests_session=None):
         return None
     
     # Try RapidAPI first if key is provided
-    if rapidapi_key:
-        print("Using RapidAPI key: ", rapidapi_key)
+    if onionapi_key:
+        print("Using RapidAPI key: ", onionapi_key)
         # Try multiple RapidAPI endpoints for RSS/News - different APIs may have different access levels
         rapidapi_endpoints = [
             {
@@ -385,7 +388,7 @@ def get_onion_headlines(rapidapi_key=None, requests_session=None):
         for endpoint in rapidapi_endpoints:
             try:
                 headers = {
-                    "X-RapidAPI-Key": rapidapi_key,
+                    "X-RapidAPI-Key": onionapi_key,
                     "X-RapidAPI-Host": endpoint['host']
                 }
                 # Handle POST requests (like NewsomaticAPI)
@@ -526,7 +529,7 @@ def get_temperature_text(api_key, lat, lon, requests_session):
     return text
 
 def get_pretty_time_text():
-        # Get the current time structure
+    # Get the current time structure
     now = time.localtime(time.time())
 
     # Format manually using an f-string
@@ -535,9 +538,81 @@ def get_pretty_time_text():
     if hour == 0: hour = 12  # Handle 12 AM/PM logic
     am_pm = "AM" if now.tm_hour < 12 else "PM"
 
-    pretty_time = f"{hour:2}:{now.tm_min:02}:{now.tm_sec:02} {am_pm}"
+    # Get day of week abbreviation (tm_wday: 0=Monday, 6=Sunday in CircuitPython)
+    day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    day_abbrev = day_names[now.tm_wday]
+
+    pretty_time = f"{hour:2}:{now.tm_min:02}{am_pm} {day_abbrev}"
 
     return pretty_time
+
+ # Parse ISO 8601 timestamps manually (CircuitPython doesn't have datetime)
+def parse_iso_timestamp(iso_str):
+        """Parse ISO 8601 timestamp and return (year, month, day, hour, minute, second)"""
+        try:
+            # Format: "2024-01-15T14:30:00-05:00" or "2024-01-15T14:30:00Z"
+            # Remove 'Z' suffix if present
+            if iso_str.endswith('Z'):
+                iso_str = iso_str[:-1] + '+00:00'
+            
+            # Split date and time
+            if 'T' in iso_str:
+                date_part, time_part = iso_str.split('T', 1)
+            else:
+                date_part = iso_str.split(' ')[0]
+                time_part = iso_str.split(' ')[1] if ' ' in iso_str else iso_str
+            
+            # Parse date
+            year, month, day = map(int, date_part.split('-'))
+            
+            # Remove timezone offset if present
+            # Look for timezone pattern: +HH:MM or -HH:MM at the end
+            time_part_clean = time_part
+            if '+' in time_part:
+                # Positive timezone: "14:30:00+05:00"
+                parts = time_part.split('+', 1)
+                if len(parts) == 2 and ':' in parts[1]:
+                    time_part_clean = parts[0]
+            elif '-' in time_part:
+                # Could be negative timezone: "14:30:00-05:00"
+                # Find the last '-' and check if what follows looks like a timezone (HH:MM)
+                last_dash_pos = time_part.rfind('-')
+                if last_dash_pos > 0:
+                    # Check if what follows the dash looks like a timezone
+                    after_dash = time_part[last_dash_pos + 1:]
+                    if ':' in after_dash:
+                        # Split to check if it's in HH:MM format
+                        tz_parts = after_dash.split(':')
+                        if len(tz_parts) == 2:
+                            # Check if both parts are digits (timezone format)
+                            if tz_parts[0].isdigit() and tz_parts[1].isdigit():
+                                # This is a timezone, remove it
+                                time_part_clean = time_part[:last_dash_pos]
+            
+            # Remove microseconds if present (e.g., "14:30:00.123")
+            if '.' in time_part_clean:
+                time_part_clean = time_part_clean.split('.')[0]
+            
+            # Parse time (format: "HH:MM:SS")
+            time_parts = time_part_clean.split(':')
+            if len(time_parts) < 2:
+                print(f"Invalid time format: {time_part_clean} (from {time_part})")
+                return None
+            
+            hour = int(time_parts[0])
+            minute = int(time_parts[1])
+            second = int(time_parts[2]) if len(time_parts) > 2 else 0
+            
+            return (year, month, day, hour, minute, second)
+        except Exception as e:
+            print(f"Error parsing timestamp from {iso_str}: {e}")
+            import sys
+            try:
+                sys.print_exception(e)
+            except AttributeError:
+                pass
+            return None
+
 def get_redline_departure_text(api_key, requests_session):
     """
     Fetches the next 3 inbound Red Line train arrival times at Porter Square using the MBTA V3 API.
@@ -560,13 +635,14 @@ def get_redline_departure_text(api_key, requests_session):
     # Try MBTA V3 API endpoint for predictions
     url = f"https://api-v3.mbta.com/predictions"
     
-    # Parameters for filtering
+    
+    # Parameters for filtering - fetch more to filter for trains >= 5 minutes away
     params = {
         "filter[route]": route,
         "filter[stop]": stop_id,
         "filter[direction_id]": direction_id,
         "sort": "arrival_time",
-        "page[limit]": 3  # Get the next 3 trains
+        "page[limit]": 10  # Fetch more predictions to filter for those >= 5 minutes away
     }
     
     # Build URL with query parameters manually (adafruit_requests doesn't support params keyword)
@@ -581,87 +657,30 @@ def get_redline_departure_text(api_key, requests_session):
         "x-api-key": api_key,
         "Content-Type": "application/json"
     }
-
+    
     try:
         # Make the GET request to the API        try:
         response = requests_session.get(url_with_params, headers=headers, timeout=10)
         
         if response.status_code != 200:
             response.close()
+            import gc
+            gc.collect()
             return f"MBTA API returned status code {response.status_code}"
         
-        # Parse the JSON response
+        # Parse the JSON response - do this immediately and free response
         data = response.json()
         response.close()
+        import gc
+        gc.collect()  # Free memory from response immediately
         
         # Check if we have any predictions
         if not data.get('data') or len(data['data']) == 0:
+            del data  # Free memory
+            gc.collect()
             return "No inbound Red Line trains scheduled at Porter Square."
         
-        # Parse ISO 8601 timestamps manually (CircuitPython doesn't have datetime)
-        def parse_iso_timestamp(iso_str):
-            """Parse ISO 8601 timestamp and return (year, month, day, hour, minute, second)"""
-            try:
-                # Format: "2024-01-15T14:30:00-05:00" or "2024-01-15T14:30:00Z"
-                # Remove 'Z' suffix if present
-                if iso_str.endswith('Z'):
-                    iso_str = iso_str[:-1] + '+00:00'
-                
-                # Split date and time
-                if 'T' in iso_str:
-                    date_part, time_part = iso_str.split('T', 1)
-                else:
-                    date_part = iso_str.split(' ')[0]
-                    time_part = iso_str.split(' ')[1] if ' ' in iso_str else iso_str
-                
-                # Parse date
-                year, month, day = map(int, date_part.split('-'))
-                
-                # Remove timezone offset if present
-                # Look for timezone pattern: +HH:MM or -HH:MM at the end
-                time_part_clean = time_part
-                if '+' in time_part:
-                    # Positive timezone: "14:30:00+05:00"
-                    parts = time_part.split('+', 1)
-                    if len(parts) == 2 and ':' in parts[1]:
-                        time_part_clean = parts[0]
-                elif '-' in time_part:
-                    # Could be negative timezone: "14:30:00-05:00"
-                    # Find the last '-' and check if what follows looks like a timezone (HH:MM)
-                    last_dash_pos = time_part.rfind('-')
-                    if last_dash_pos > 0:
-                        # Check if what follows the dash looks like a timezone
-                        after_dash = time_part[last_dash_pos + 1:]
-                        if ':' in after_dash:
-                            # Split to check if it's in HH:MM format
-                            tz_parts = after_dash.split(':')
-                            if len(tz_parts) == 2:
-                                # Check if both parts are digits (timezone format)
-                                if tz_parts[0].isdigit() and tz_parts[1].isdigit():
-                                    # This is a timezone, remove it
-                                    time_part_clean = time_part[:last_dash_pos]
-                
-                # Remove microseconds if present (e.g., "14:30:00.123")
-                if '.' in time_part_clean:
-                    time_part_clean = time_part_clean.split('.')[0]
-                
-                # Parse time (format: "HH:MM:SS")
-                time_parts = time_part_clean.split(':')
-                if len(time_parts) < 2:
-                    print(f"Invalid time format: {time_part_clean} (from {time_part})")
-                    return None
-                
-                hour = int(time_parts[0])
-                minute = int(time_parts[1])
-                second = int(time_parts[2]) if len(time_parts) > 2 else 0
-                
-                return (year, month, day, hour, minute, second)
-            except Exception as e:
-                print(f"Error parsing timestamp from {iso_str}: {e}")
-                import sys
-                sys.print_exception(e)
-                return None
-        
+               
         def calculate_minutes_until(arrival_tuple, current_time_tuple):
             """Calculate minutes until arrival time"""
             if arrival_tuple is None or current_time_tuple is None:
@@ -692,16 +711,21 @@ def get_redline_departure_text(api_key, requests_session):
         current_tuple = (current_time.tm_year, current_time.tm_mon, current_time.tm_mday,
                         current_time.tm_hour, current_time.tm_min, current_time.tm_sec)
         
-        # Process up to 3 predictions
+        # Process predictions and filter for those >= 5 minutes away
         train_times = []
-        predictions = data['data'][:3]  # Get up to 3 predictions
+        predictions = data.get('data', [])
         
-        for prediction in predictions:
+        # Free the full data dict early - we only need predictions now
+        predictions_list = list(predictions)  # Make a copy
+        del data  # Free memory from full response
+        import gc
+        gc.collect()
+        
+        for i, prediction in enumerate(predictions_list):
             attributes = prediction.get('attributes', {})
             
             # Get arrival time (prefer arrival_time, fall back to departure_time)
             arrival_time_str = attributes.get('arrival_time') or attributes.get('departure_time')
-            print(f"arrival_time_str: {arrival_time_str}")
             if not arrival_time_str:
                 continue  # Skip this prediction if no time available
             
@@ -710,70 +734,60 @@ def get_redline_departure_text(api_key, requests_session):
             if arrival_tuple is None:
                 continue
             
-            year, month, day, hour, minute, second = arrival_tuple
-            
             # Calculate minutes until arrival
             minutes_until = calculate_minutes_until(arrival_tuple, current_tuple)
             
-            # Format time for display (12-hour format)
-            hour_12 = hour % 12
-            if hour_12 == 0:
-                hour_12 = 12
-            am_pm = "AM" if hour < 12 else "PM"
-            time_str = f"{hour_12}:{minute:02d} {am_pm}"
+            # Only include trains that are at least 5 minutes away
+            if minutes_until is not None and minutes_until >= 8 :
+                train_times.append(minutes_until)
+                # Stop once we have 2 trains that meet the criteria
+                if len(train_times) >= 2:
+                    break
             
-            # Format time description with minutes until
-            if minutes_until is None:
-                time_desc = f"{time_str}"
-            elif minutes_until < 0:
-                time_desc = f"{time_str} (departed)"
-            elif minutes_until == 0:
-                time_desc = f"{time_str} (arriving now!)"
-            elif minutes_until == 1:
-                time_desc = f"{time_str} (in 1 min)"
-            else:
-                time_desc = f"{time_str} (in {minutes_until} min)"
-            
-            #train_times.append(time_desc)
-            train_times.append(minutes_until)
+            # Free intermediate variables
+            del prediction, arrival_tuple, minutes_until
         
         if not train_times:
             return "No arrival times available for inbound Red Line trains at Porter Square."
         
-        # Format the output with all train times
-        #result = "Next inbound Red Line trains at Porter Square:\n"
+        # Format the output with train times (already filtered to >= 5 minutes)
         result = ""
         time_count = 0
-        for i, time_desc in enumerate(train_times, 1):
-            print(f" {i} time_desc: {time_desc}")
-            if (time_count > 0):
+        for time_desc in train_times:
+            if time_count > 0:
                 result += ","
-            if (time_desc > 5):
-                result += f"{time_desc}"
+            if time_desc is not None:
+                result += str(time_desc)
                 time_count += 1
-            if (time_count == 2):
+            if time_count >= 2:
                 break
-        if (time_count > 0):
+        
+        # Free train_times list
+        del train_times
+        import gc
+        gc.collect()
+        
+        if time_count > 0:
             result += " mins"
         else:
-            if (len(train_times) > 0):
-                result = f"{time_desc} mins"
-            else:
-                result = "No trains"
+            result = "No trains"
         
-        return result.strip()  # Remove trailing newline
+        return result.strip()
     
     except Exception as e:
+        print(f"Error fetching MBTA data: {e}")
+        import gc
+        gc.collect()  # Free memory on error
         return "No MBTA data"
 
-def display_monitor(api_key, rapidapi_key, mbta_api_key, requests_session, interval_seconds=10):
+def display_monitor(api_key, onionapi_key, mbta_api_key, requests_session, interval_seconds=10):
     """
     Continuously monitors temperature by querying every specified interval.
     This function runs in a loop and is designed to be executed in a thread.
     
     Args:
         api_key (str): OpenWeatherMap API key
-        rapidapi_key (str): RapidAPI key for fetching Onion headlines
+        onionapi_key (str): RapidAPI key for fetching Onion headlines
         mbta_api_key (str): MBTA API key
         requests_session: The adafruit_requests session object
         interval_minutes (int): Interval in minutes between temperature queries (default: 10)
@@ -828,6 +842,8 @@ def display_monitor(api_key, rapidapi_key, mbta_api_key, requests_session, inter
     max_state = 2 
 
     location_found = False
+    lat = None  # Initialize lat and lon to avoid "referenced before assignment" error
+    lon = None
     temperature_query_interval_secs = 240
     redline_query_interval_secs = 60
     last_temperature_query_time = 0
@@ -840,7 +856,25 @@ def display_monitor(api_key, rapidapi_key, mbta_api_key, requests_session, inter
             gc.collect()
             print(f"Free memory: {gc.mem_free()}")
             if (not location_found):
-                lat,lon = get_current_location(requests_session)
+                try:
+                    location_result = get_current_location(requests_session)
+                    # Ensure we got a valid tuple result
+                    if location_result is not None and isinstance(location_result, (tuple, list)) and len(location_result) == 2:
+                        try:
+                            lat, lon = location_result
+                            # Ensure lat and lon are valid numbers or None
+                            if lat is None or lon is None:
+                                lat, lon = None, None
+                        except (ValueError, TypeError) as unpack_error:
+                            print(f"Error unpacking location result: {unpack_error}")
+                            lat, lon = None, None
+                    else:
+                        print(f"Invalid location result: {location_result}")
+                        lat, lon = None, None
+                except Exception as loc_error:
+                    print(f"Error getting location: {loc_error}")
+                    lat, lon = None, None
+                
                 if lat is None or lon is None:
                     print("Error: Could not determine location. Temperature monitoring not possible.")
                     location_found = False
@@ -848,13 +882,25 @@ def display_monitor(api_key, rapidapi_key, mbta_api_key, requests_session, inter
                     location_found = True
 
             if (last_temperature_text == "" or time.time() - last_temperature_query_time > temperature_query_interval_secs):
-                last_temperature_text = get_temperature_text(api_key, lat, lon, requests_session)
-                last_temperature_query_time = time.time()
-                print(f"updated temperature_text: {last_temperature_text}")
+                # Only query temperature if we have valid location
+                if location_found and lat is not None and lon is not None:
+                    last_temperature_text = get_temperature_text(api_key, lat, lon, requests_session)
+                    last_temperature_query_time = time.time()
+                    print(f"updated temperature_text: {last_temperature_text}")
+                else:
+                    last_temperature_text = "Location not available"
+                    print("Skipping temperature query - location not available")
             if (last_redline_text == "" or time.time() - last_redline_query_time > redline_query_interval_secs):
+                # Free memory before MBTA request to avoid allocation errors
+                gc.collect()
                 last_redline_text = get_redline_departure_text(mbta_api_key, requests_session)
                 last_redline_query_time = time.time()
+                gc.collect()  # Free memory after request too
                 print(f"updated redline_text: {last_redline_text}")
+            # Initialize text and color to avoid "referenced before assignment" error
+            text = ""
+            color = DESCRIPTION_COLOR
+            
             if state == 1:
                 if (location_found):
                     color = DESCRIPTION_COLOR
@@ -865,10 +911,13 @@ def display_monitor(api_key, rapidapi_key, mbta_api_key, requests_session, inter
             elif state == 2:
                 color = RED_COLOR
                 text = last_redline_text
+            else:
+                # Fallback for unknown state
+                color = RED_COLOR
+                text = "Unknown state"
 
             print(f"State: {state}, Text: {text}")
-            print(f"time.time(): {time.time()}")
-            text += "\n " + get_pretty_time_text()
+            text += "\n" + get_pretty_time_text()
             #text = "1234567890"
             info_text_label.text = text
             info_text_label.color = color
@@ -878,8 +927,18 @@ def display_monitor(api_key, rapidapi_key, mbta_api_key, requests_session, inter
 
         except Exception as e:
             print(f"Error in temperature monitoring: {e}")
+            # Print full traceback for debugging (CircuitPython compatible)
+            import sys
+            try:
+                try:
+                    sys.print_exception(e)
+                except AttributeError:
+                    pass
+            except AttributeError:
+                # sys.print_exception not available, just print the error
+                pass
 
-        time.sleep(interval_seconds)
+        time.sleep(interval_seconds)  # Always sleep after each iteration
 
 def main():
     # If you are using a board with pre-defined ESP32 Pins:
@@ -913,7 +972,7 @@ def main():
     pool = adafruit_connection_manager.get_radio_socketpool(esp)
     ssl_context = adafruit_connection_manager.get_radio_ssl_context(esp)
     requests_session = adafruit_requests.Session(pool, ssl_context)
- 
+
     if esp.status == adafruit_esp32spi.WL_IDLE_STATUS:
         print("ESP32 found and in idle mode")
     print("Firmware vers.", esp.firmware_version)
@@ -957,11 +1016,8 @@ def main():
     
     print("Done! starting display monitor...")
     
-    api_key = "e218772439e267b3f123e89567d1909c"  # Replace with your actual OpenWeatherMap API key
-    rapidapi_key = "e9f5733fbcmsh44e4bbf0b190180p11af65jsn134bd09fba9f"  # Replace with your actual RapidAPI key
-    mbta_api_key = "3864d934cd784a05993611aa3fb428d9"
 
-    display_monitor(api_key, rapidapi_key, mbta_api_key, requests_session, interval_seconds=10)
+    display_monitor(api_key, onionapi_key, mbta_api_key, requests_session, interval_seconds=10)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,7 @@
+# Ignore the actual secrets file
+settings.toml
+
+# Ignore Mac/Windows system files
+.DS_Store
+Thumbs.db
+
