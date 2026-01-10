@@ -1,3 +1,4 @@
+#copy thjis to settings.toml and fill in the info
 CIRCUITPY_WIFI_SSID = "wifi-ssid"
 CIRCUITPY_WIFI_PASSWORD = "wifi-passaword"
 
