@@ -658,12 +658,14 @@ def get_redline_departure_text(api_key, requests_session):
         "Content-Type": "application/json"
     }
     
+    response = None
     try:
-        # Make the GET request to the API        try:
+        # Make the GET request to the API
         response = requests_session.get(url_with_params, headers=headers, timeout=10)
         
         if response.status_code != 200:
             response.close()
+            response = None
             import gc
             gc.collect()
             return f"MBTA API returned status code {response.status_code}"
@@ -671,6 +673,7 @@ def get_redline_departure_text(api_key, requests_session):
         # Parse the JSON response - do this immediately and free response
         data = response.json()
         response.close()
+        response = None
         import gc
         gc.collect()  # Free memory from response immediately
         
@@ -779,6 +782,14 @@ def get_redline_departure_text(api_key, requests_session):
         import gc
         gc.collect()  # Free memory on error
         return "No MBTA data"
+    finally:
+        # Always close response if it was opened, so the socket is released.
+        # Leaving it open can exhaust the connection pool and cause the next request to hang.
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
 
 def display_monitor(api_key, onionapi_key, mbta_api_key, requests_session, interval_seconds=10):
     """
