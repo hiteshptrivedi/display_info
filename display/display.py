@@ -17,7 +17,7 @@ def get_temperature(lat, lon, api_key):
         float: The temperature in Celsius, or None if an error occurred.
     """
     # The URL format for the current weather data API
-    url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={api_key}"
+    url = f"https://api.openweathermap.org/data/3.0/weather?lat={lat}&lon={lon}&appid={api_key}"
 
     try:
         # Make the GET request to the API
