@@ -39,7 +39,7 @@ redline_query_interval_secs = 60
 time_sync_interval_secs = 6000
 
 # Debug flag - set to False to disable ALL serial output (prevents hangs when USB/power connected)
-DEBUG_ENABLED = True  # Set to True only when debugging with serial console
+DEBUG_ENABLED = False  # Set to True only when debugging with serial console
 
 # Conditional print - no serial output when False (avoids buffer block and hang)
 def debug_print(*args, **kwargs):
@@ -262,95 +262,94 @@ def get_temperature(lat, lon, api_key, requests_session):
         debug_print("Error: Could not parse weather data (city not found or API issue).")
         return None, None
 
-def get_forecast_temperature(lat, lon, api_key, requests_session, hours_ahead=6):
+def get_forecast_summary(lat, lon, api_key, requests_session, hours_ahead=6):
     """
-    Fetches the temperature forecast for a specified number of hours from now using the OpenWeatherMap API.
-    
-    Args:
-        lat (float): Latitude
-        lon (float): Longitude
-        api_key (str): Your OpenWeatherMap API key.
-        requests_session: The adafruit_requests session object
-        hours_ahead (int): Number of hours ahead to get forecast for (default: 6)
-    
+    Fetches a compact forecast summary using a single 5-day/3-hour forecast call.
+
     Returns:
-        tuple: (temperature in Celsius, description) or (None, None) if an error occurred.
+        tuple: (forecast_temp, day1_label, day1_high, day2_label, day2_high) or None on error.
     """
-    # The URL format for the 5 Day / 3 Hour Forecast API
-    # Use cnt parameter to limit response size - forecasts are in 3-hour intervals
-    # For 6 hours ahead, we need at most 3 entries (0h, 3h, 6h), using 4 to be safe
-    url = f"https://api.openweathermap.org/data/2.5/forecast?lat={lat}&lon={lon}&appid={api_key}&units=imperial&cnt=4"
-    debug_print(f"forecast url: {url}")
+    # Limit to ~36 hours (12 * 3-hour entries) to reduce memory usage.
+    gc.collect()
+    url = f"https://api.openweathermap.org/data/2.5/forecast?lat={lat}&lon={lon}&appid={api_key}&units=imperial&cnt=12"
+    debug_print(f"forecast summary url: {url}")
     response = None
     try:
-        # Make the GET request to the API
         response = requests_session.get(url)
-        # Check status code
         if response.status_code != 200:
             debug_print(f"Forecast API returned status code {response.status_code}")
             response.close()
-            return None, None
-        
-        # Parse the JSON response
+            return None
         data = response.json()
-        response.close()  # Always close the response immediately to free memory
-        
-        # Get current time (Unix timestamp)
-        current_time = time.time()
-        target_time = current_time + (hours_ahead * 3600)  # hours_ahead in seconds
-        
-        # Find the forecast entry closest to the target time
-        forecast_list = data.get('list', [])
+        response.close()
+
+        forecast_list = data.get("list", [])
         if not forecast_list:
-            del data  # Free memory
+            del data
             gc.collect()
             debug_print("No forecast data available")
-            return None, None
-        
-        # Find the forecast entry that's closest to hours_ahead from now
-        closest_forecast = None
-        min_time_diff = float('inf')
-        
+            return None
+
+        current_time = time.time()
+        target_time = current_time + (hours_ahead * 3600)
+        closest_forecast_temp = None
+        min_time_diff = float("inf")
+
+        day1 = time.localtime(current_time + 86400)
+        day2 = time.localtime(current_time + 2 * 86400)
+        day1_key = (day1.tm_year, day1.tm_mon, day1.tm_mday)
+        day2_key = (day2.tm_year, day2.tm_mon, day2.tm_mday)
+        highs = {day1_key: None, day2_key: None}
+
         for forecast in forecast_list:
-            # Use the 'dt' field which is a Unix timestamp (more reliable than parsing strings)
-            forecast_timestamp = forecast.get('dt')
-            if forecast_timestamp is None:
+            ts = forecast.get("dt")
+            if ts is None:
                 continue
-            
-            # Calculate time difference
-            time_diff = abs(forecast_timestamp - target_time)
-            
-            # If this forecast is in the future and closer to our target, use it
-            if forecast_timestamp >= current_time and time_diff < min_time_diff:
+            lt = time.localtime(ts)
+            key = (lt.tm_year, lt.tm_mon, lt.tm_mday)
+
+            temp = forecast.get("main", {}).get("temp")
+            if temp is not None and key in highs:
+                current_high = highs[key]
+                if current_high is None or temp > current_high:
+                    highs[key] = temp
+
+            time_diff = abs(ts - target_time)
+            if ts >= current_time and time_diff < min_time_diff:
                 min_time_diff = time_diff
-                closest_forecast = forecast
-        
-        # Extract the temperature and description before freeing memory
-        if closest_forecast is None:
-            del data, forecast_list  # Free memory
-            gc.collect()
-            debug_print(f"Could not find forecast for {hours_ahead} hours ahead")
-            return None, None
-        
-        temperature = closest_forecast['main']['temp']
-        description = closest_forecast['weather'][0]['description']
-        
-        # Free memory immediately after extracting what we need
-        del data, forecast_list, closest_forecast
+                closest_forecast_temp = temp
+
+        del data, forecast_list
         gc.collect()
-        
-        return temperature, description
-        
-    except Exception as e:
-        debug_print(f"Error fetching forecast data: {e}")
+
+        day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        day1_initial = day_names[day1.tm_wday] + ":"
+        day2_initial = day_names[day2.tm_wday] + ":"
+        return (
+            closest_forecast_temp,
+            day1_initial,
+            highs[day1_key],
+            day2_initial,
+            highs[day2_key],
+        )
+    except MemoryError as e:
+        debug_print(f"Error fetching forecast summary: {e}")
         try:
             response.close()
         except:
             pass
-        return None, None
+        gc.collect()
+        return None
+    except Exception as e:
+        debug_print(f"Error fetching forecast summary: {e}")
+        try:
+            response.close()
+        except:
+            pass
+        return None
     except KeyError:
-        debug_print("Error: Could not parse forecast data (API issue).")
-        return None, None
+        debug_print("Error: Could not parse forecast summary data (API issue).")
+        return None
 
 def get_current_location(requests_session):
     """
@@ -632,8 +631,12 @@ def get_temperature_text(api_key, lat, lon, requests_session):
     debug_print(f"Temperature monitoring started. Location: {lat:.4f}, {lon:.4f}")
     # Query current temperature
     temp_F, desc = get_temperature(lat, lon, api_key, requests_session)
-    # Query 6-hour forecast temperature
-    forecast_temp_F, forecast_desc = get_forecast_temperature(lat, lon, api_key, requests_session, hours_ahead=6)
+    # Query 6-hour forecast temperature + next two day highs (single API call)
+    forecast_summary = get_forecast_summary(lat, lon, api_key, requests_session, hours_ahead=6)
+    if forecast_summary is not None:
+        forecast_temp_F, day1_initial, day1_high, day2_initial, day2_high = forecast_summary
+    else:
+        forecast_temp_F, day1_initial, day1_high, day2_initial, day2_high = (None, None, None, None, None)
     
     if temp_F is not None:
         temp_F = round(temp_F, 0)
@@ -650,14 +653,21 @@ def get_temperature_text(api_key, lat, lon, requests_session):
             forecast_temp_F = int(forecast_temp_F)
             text = f"[{timestamp}] Now: {temp_F}°F {desc}. 6h: {forecast_temp_F}°F"
             debug_print(text)
-            text = f"{temp_F}°F > {forecast_temp_F}°F"
+            text = f"{temp_F}°F -> {forecast_temp_F}°F"
         else:
             text = f"[{timestamp}] The temperature is {temp_F}°F with {desc}."
             debug_print(text)
             text = f"{temp_F}°F >"
+        if day1_high is not None and day2_high is not None:
+            day1_high = int(round(day1_high, 0))
+            day2_high = int(round(day2_high, 0))
+            forecast_line = f"{day1_initial}{day1_high}\n{day2_initial}{day2_high}"
+        else:
+            forecast_line = "No Forecast"
+        text = text + "\n" + forecast_line
         fail_count = 0
     else:
-        text = "Failed to fetch temperature data.";
+        text = "Failed to get temperature.";
         fail_count += 1
         if fail_count > 10:
             text = "Failed to fetch temperature data."
@@ -673,13 +683,13 @@ def get_pretty_time_text():
     # tm_hour, tm_min, and tm_sec are the attributes we need
     hour = now.tm_hour % 12
     if hour == 0: hour = 12  # Handle 12 AM/PM logic
-    am_pm = "AM" if now.tm_hour < 12 else "PM"
+    am_pm = "am" if now.tm_hour < 12 else "pm"
 
     # Get day of week abbreviation (tm_wday: 0=Monday, 6=Sunday in CircuitPython)
     day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     day_abbrev = day_names[now.tm_wday]
 
-    pretty_time = f"{hour:2}:{now.tm_min:02}{am_pm} {day_abbrev}"
+    pretty_time = f"{hour}:{now.tm_min:02}{am_pm} {day_abbrev}"
 
     return pretty_time
 
@@ -852,7 +862,7 @@ def get_redline_departure_text(api_key, requests_session):
 
         if not train_times:
             return "No arrival times available."
-        result = ",".join(str(t) for t in train_times[:2]) + " mins"
+        result = ",".join(str(t) for t in train_times[:2]) + " mins" 
         gc.collect()
         return result
     except Exception:
@@ -896,7 +906,7 @@ def display_monitor(api_key, onionapi_key, mbta_api_key, requests_session, inter
 
 
     #small_font = cwd + "/fonts/Arial-12.bdf"
-    small_font = cwd + "/fonts/MyFont-08.bdf"
+    small_font = cwd + "/fonts/MyFont-5x7.bdf"
     #medium_font = cwd + "/fonts/Arial-14.bdf"
 
     small_font = bitmap_font.load_font(small_font)
@@ -906,6 +916,8 @@ def display_monitor(api_key, onionapi_key, mbta_api_key, requests_session, inter
     MAIN_COLOR = 0x9000FF  # weather condition
     DESCRIPTION_COLOR = 0x00D3FF
     RED_COLOR = 0xFF0000
+    YELLOW_COLOR = 0xFFFF00
+    GREEN_COLOR = 0x00FF00
     glyphs = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-,.: "
     small_font.load_glyphs(glyphs)
     #medium_font.load_glyphs(glyphs)
@@ -920,7 +932,7 @@ def display_monitor(api_key, onionapi_key, mbta_api_key, requests_session, inter
 
     group.append(info_text_label)  # add the clock label to the group
     state = 1
-    max_state = 2 
+    max_state = 3 
 
     location_found = False
     lat = None  # Initialize lat and lon to avoid "referenced before assignment" error
@@ -972,7 +984,7 @@ def display_monitor(api_key, onionapi_key, mbta_api_key, requests_session, inter
             if (last_redline_text == "" or cur_time - last_redline_query_time > redline_query_interval_secs):
                 # Free memory before MBTA request to avoid allocation errors
                 gc.collect()
-                last_redline_text = get_redline_departure_text(mbta_api_key, requests_session)
+                last_redline_text = "MBTA:\n" + get_redline_departure_text(mbta_api_key, requests_session)
                 last_redline_query_time = cur_time
                 gc.collect()  # Free memory after request too
                 debug_print(f"updated redline_text: {last_redline_text}")
@@ -984,6 +996,7 @@ def display_monitor(api_key, onionapi_key, mbta_api_key, requests_session, inter
                     last_time_sync_time = cur_time
                 else:
                     debug_print("Warning: Could not sync system time, using device's current time")
+                    last_time_sync_time = 0
             text = ""
             color = DESCRIPTION_COLOR
             
@@ -997,13 +1010,45 @@ def display_monitor(api_key, onionapi_key, mbta_api_key, requests_session, inter
             elif state == 2:
                 color = RED_COLOR
                 text = last_redline_text
+            elif state == 3:
+                # School countdown
+                try:
+                    # Target: May 29, 2026
+                    target_time = time.mktime((2026, 5, 29, 0, 0, 0, 0, 0, -1))
+                    now = time.time()
+                    diff = target_time - now
+                    days_left = int(diff / 86400) + 1
+                    if days_left < 0:
+                        days_left = 0
+                    
+                    text = f"{days_left} days\nleft until"
+                    
+                    if days_left > 90:
+                        color = RED_COLOR
+                    elif days_left > 60:
+                        color = YELLOW_COLOR
+                    elif days_left < 30:
+                        color = GREEN_COLOR
+                    else:
+                        color = YELLOW_COLOR
+
+                    now_struct = time.localtime()
+                    month_names = ["", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12"]
+                    #date_str = f"{month_names[now_struct.tm_mon]}/{now_struct.tm_mday}/{now_struct.tm_year}"
+                    date_str = f"5/29/26"
+                    text += f"\n{date_str}"
+                except Exception as e:
+                    debug_print(f"Error in state 3: {e}")
+                    text = "Date Error"
+                    color = RED_COLOR
             else:
                 # Fallback for unknown state
                 color = RED_COLOR
                 text = "Unknown state"
 
             debug_print(f"State: {state}, Text: {text}")
-            text += "\n" + get_pretty_time_text()
+            if state != 1 and state != 3:
+                text += "\n" + get_pretty_time_text()
             #text = "1234567890"
             info_text_label.text = text
             info_text_label.color = color
@@ -1068,18 +1113,24 @@ def main():
     debug_print("Connected to", esp.ap_info.ssid, "\tRSSI:", esp.ap_info.rssi)
     debug_print("My IP address is", esp.ipv4_address)
     
-    # Wait a moment for network to stabilize and DNS to be ready
-    debug_print("Waiting for network to stabilize...")
-    time.sleep(5)  # Give DNS time to be ready
-    
     # Test DNS resolution with a simple hostname first
-    try:
-        debug_print("Testing DNS resolution...")
-        test_ip = esp.get_host_by_name("google.com")
-        debug_print(f"DNS test successful: google.com -> {test_ip}")
-    except Exception as dns_test_error:
-        debug_print(f"DNS test failed: {dns_test_error}")
-        debug_print("DNS may not be ready yet, will retry in time sync function")
+    count = 0
+    max_attempts = 5
+    while count < max_attempts: 
+        try:
+            debug_print("Testing DNS resolution... attempt ", count)
+            test_ip = esp.get_host_by_name("google.com")
+            debug_print(f"DNS test successful: google.com -> {test_ip}")
+            break
+        except Exception as dns_test_error:
+            debug_print(f"DNS test failed: {dns_test_error}")
+            debug_print("DNS may not be ready yet")
+            #time.sleep(2)
+            count += 1
+    
+    if count >= max_attempts:
+        debug_print("DNS resolution failed after max attempts. Rebooting...")
+        microcontroller.reset()
     
     # Sync system time from internet
     debug_print("\nSyncing system time from internet...")
